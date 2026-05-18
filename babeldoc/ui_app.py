@@ -40,6 +40,8 @@ ICON_ICO = PROJECT_ROOT / "babeldoc" / "assets" / "ui" / "babeldoc-ui-icon.ico"
 STAGES = [
     "Parse PDF and Create Intermediate Representation",
     "DetectScannedFile",
+    "Parse Table",
+    "Extract Terms",
     "Parse Page Layout",
     "Parse Paragraphs",
     "Parse Formulas and Styles",
@@ -50,6 +52,10 @@ STAGES = [
     "Subset font",
     "Save PDF",
 ]
+
+STAGE_PROGRESS = {
+    stage: ((index + 1) / len(STAGES)) * 92 for index, stage in enumerate(STAGES)
+}
 
 
 def _app_data_dir() -> Path:
@@ -239,6 +245,10 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.stopped_count = 0
         self.finished_indices: set[int] = set()
         self.file_progress: dict[int, float] = {}
+        self.file_stages: dict[int, str] = {}
+        self.file_started_at: dict[int, float] = {}
+        self.file_finished_at: dict[int, float] = {}
+        self.file_token_usage: dict[int, dict[str, int]] = {}
         self.batch_output_dirs: list[Path] = []
 
         self._configure_style()
@@ -306,6 +316,7 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.show_key_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_text_var = tk.StringVar(value="Ready")
+        self.progress_detail_var = tk.StringVar(value="")
         self.file_count_var = tk.StringVar(value="0 files")
 
     def _load_icon(self) -> None:
@@ -514,16 +525,22 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             side=tk.RIGHT
         )
 
-        columns = ("name", "folder", "status")
+        columns = ("name", "folder", "progress", "stage", "tokens", "status")
         self.file_tree = ttk.Treeview(
             panel, columns=columns, show="headings", selectmode="extended", height=10
         )
         self.file_tree.heading("name", text="File")
         self.file_tree.heading("folder", text="Folder")
+        self.file_tree.heading("progress", text="Progress")
+        self.file_tree.heading("stage", text="Stage")
+        self.file_tree.heading("tokens", text="Tokens")
         self.file_tree.heading("status", text="Status")
-        self.file_tree.column("name", width=360, anchor="w")
-        self.file_tree.column("folder", width=360, anchor="w")
-        self.file_tree.column("status", width=110, anchor="w")
+        self.file_tree.column("name", width=250, anchor="w")
+        self.file_tree.column("folder", width=230, anchor="w")
+        self.file_tree.column("progress", width=80, anchor="e")
+        self.file_tree.column("stage", width=205, anchor="w")
+        self.file_tree.column("tokens", width=90, anchor="e")
+        self.file_tree.column("status", width=100, anchor="w")
         self.file_tree.grid(row=1, column=0, sticky="nsew")
         yscroll = ttk.Scrollbar(panel, orient=tk.VERTICAL, command=self.file_tree.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
@@ -561,6 +578,9 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             panel, mode="determinate", maximum=100, style="Horizontal.TProgressbar"
         )
         self.progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(panel, textvariable=self.progress_detail_var, style="Muted.TLabel").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        )
 
     def _build_log_panel(self, parent: ttk.Frame) -> None:
         panel = ttk.LabelFrame(parent, text="Run log", style="Panel.TLabelframe", padding=8)
@@ -636,16 +656,39 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 "",
                 tk.END,
                 iid=str(index),
-                values=(path.name, str(path.parent), status),
+                values=(path.name, str(path.parent), "0%", "", "-", status),
             )
         count = len(self.file_paths)
         self.file_count_var.set(f"{count} file{'s' if count != 1 else ''}")
 
     def _set_file_status(self, index: int, status: str) -> None:
+        self._update_file_row(index, status=status)
+
+    def _update_file_row(
+        self,
+        index: int,
+        *,
+        progress: float | None = None,
+        stage: str | None = None,
+        status: str | None = None,
+        tokens: int | str | None = None,
+    ) -> None:
         item = str(index)
         if self.file_tree.exists(item):
             values = list(self.file_tree.item(item, "values"))
-            values[2] = status
+            while len(values) < 6:
+                values.append("")
+            if progress is not None:
+                values[2] = f"{max(0.0, min(100.0, progress)):.0f}%"
+            if stage is not None:
+                values[3] = stage
+            if tokens is not None:
+                if isinstance(tokens, str):
+                    values[4] = tokens
+                else:
+                    values[4] = self._format_number(tokens)
+            if status is not None:
+                values[5] = status
             self.file_tree.item(item, values=values)
             self.file_tree.see(item)
 
@@ -769,6 +812,10 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self.stopped_count = 0
             self.finished_indices = set()
             self.file_progress = {index: 0.0 for index in range(len(pdfs))}
+            self.file_stages = {index: "Queued" for index in range(len(pdfs))}
+            self.file_started_at = {}
+            self.file_finished_at = {}
+            self.file_token_usage = {}
             self.run_started_at = time.time()
             self.last_output_dir = output_dir or pdfs[0].parent
             self.batch_output_dirs = self._batch_output_dirs(pdfs, output_dir)
@@ -840,6 +887,7 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             run_config.base_url,
             "--qps",
             str(run_config.qps),
+            "--progress-json",
             "--working-dir",
             str(working_dir),
             "--output",
@@ -995,6 +1043,8 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             assert process.stdout is not None
             prefix = f"[{file_index + 1}/{self.batch_total}] "
             for line in process.stdout:
+                if self._queue_json_progress_from_line(line, file_index):
+                    continue
                 self.output_queue.put(("log", f"{prefix}{line}"))
                 self._queue_progress_from_line(line, file_index)
             return process.wait()
@@ -1007,10 +1057,41 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                     if self.processes.get(file_index) is process:
                         del self.processes[file_index]
 
+    def _queue_json_progress_from_line(self, line: str, file_index: int) -> bool:
+        prefix = "BABELDOC_PROGRESS_JSON "
+        marker_index = line.find(prefix)
+        if marker_index < 0:
+            return False
+        try:
+            event = json.loads(line[marker_index + len(prefix) :])
+        except json.JSONDecodeError:
+            return False
+
+        event_type = event.get("type")
+        stage = str(event.get("stage") or event_type or "Progress")
+        overall_progress = event.get("overall_progress")
+        if overall_progress is None:
+            overall_progress = event.get("stage_progress", 0.0)
+        stage_current = event.get("stage_current")
+        stage_total = event.get("stage_total")
+        if stage_current is not None and stage_total not in (None, 0):
+            stage = f"{stage} ({stage_current}/{stage_total})"
+        if event_type == "token_usage":
+            self.output_queue.put(("token_usage", file_index, event))
+        elif event_type == "finish":
+            self.output_queue.put(("progress", file_index, 100.0, "Finished"))
+        elif event_type == "error":
+            self.output_queue.put(("error", f"[{file_index + 1}] {event.get('error', '')}"))
+        elif event_type in {"progress_start", "progress_update", "progress_end"}:
+            self.output_queue.put(
+                ("progress", file_index, float(overall_progress), stage)
+            )
+        return True
+
     def _queue_progress_from_line(self, line: str, file_index: int) -> None:
         for stage_index, stage in enumerate(STAGES):
             if stage in line:
-                percent = min(95.0, ((stage_index + 1) / len(STAGES)) * 90)
+                percent = STAGE_PROGRESS.get(stage, 0.0)
                 self.output_queue.put(("progress", file_index, percent, stage))
                 return
         if "Translation completed" in line:
@@ -1068,16 +1149,39 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 self.file_progress.get(index, 0.0),
                 file_percent,
             )
+            self.file_stages[index] = stage
+            self._update_file_row(index, progress=self.file_progress[index], stage=stage)
             self._update_progress(
                 self._overall_progress(),
                 f"[{index + 1}/{self.batch_total}] {stage}",
+            )
+        elif kind == "token_usage":
+            index = int(item[1])
+            usage = self._normalize_token_usage(item[2])
+            self.file_token_usage[index] = usage
+            self._update_file_row(index, tokens=usage["total_tokens"])
+            self._update_progress(
+                self._overall_progress(),
+                f"Tokens: {self._token_usage_summary(usage)}",
+            )
+            self._append_log(
+                f"[{index + 1}/{self.batch_total}] Token usage: "
+                f"{self._token_usage_summary(usage)}\n"
             )
         elif kind == "file_start":
             self.current_index = int(item[1])
             path = Path(item[2])
             self.last_output_dir = Path(item[3]) if len(item) > 3 else path.parent
-            self._set_file_status(self.current_index, "Running")
+            self.file_started_at[self.current_index] = time.time()
             self.file_progress.setdefault(self.current_index, 0.0)
+            self.file_stages[self.current_index] = "Starting"
+            self._update_file_row(
+                self.current_index,
+                progress=self.file_progress[self.current_index],
+                stage="Starting",
+                status="Running",
+                tokens="...",
+            )
             self._update_progress(self._overall_progress(), f"Running {path.name}")
             self._append_log(f"\n--- [{self.current_index + 1}/{self.batch_total}] {path} ---\n")
         elif kind == "file_done":
@@ -1086,21 +1190,51 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             stopped = bool(item[3]) if len(item) > 3 else False
             self.file_progress[index] = 100.0
             self.finished_indices.add(index)
+            self.file_finished_at[index] = time.time()
+            token_usage = self.file_token_usage.get(index)
+            token_total = token_usage["total_tokens"] if token_usage else 0
             if return_code == 0:
                 self.completed_count += 1
-                self._set_file_status(index, "Done")
+                self.file_stages[index] = "Finished"
+                self._update_file_row(
+                    index,
+                    progress=100.0,
+                    stage="Finished",
+                    status="Done",
+                    tokens=token_total,
+                )
+                if token_usage is None:
+                    self._append_log(
+                        f"[{index + 1}/{self.batch_total}] Token usage was not reported; "
+                        "showing 0.\n"
+                    )
             elif stopped:
                 self.stopped_count += 1
-                self._set_file_status(index, "Stopped")
+                self.file_stages[index] = "Stopped"
+                self._update_file_row(
+                    index,
+                    progress=100.0,
+                    stage="Stopped",
+                    status="Stopped",
+                    tokens=token_total,
+                )
             else:
                 self.failed_count += 1
-                self._set_file_status(index, f"Failed ({return_code})")
+                self.file_stages[index] = "Failed"
+                self._update_file_row(
+                    index,
+                    progress=100.0,
+                    stage="Failed",
+                    status=f"Failed ({return_code})",
+                    tokens=token_total,
+                )
             self._update_progress(self._overall_progress(), "File finished")
         elif kind == "batch_done":
             self.status_var.set(
                 f"Finished: {self.completed_count} done, {self.failed_count} failed"
             )
             self._set_running(False)
+            self._update_progress(100.0, "Batch finished")
             self.worker = None
             self.open_button.configure(state=tk.NORMAL)
             self._append_log("\n=== BabelDOC batch finished ===\n")
@@ -1109,12 +1243,14 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         elif kind == "batch_stopped":
             for index in range(self.batch_total):
                 if index not in self.finished_indices:
-                    self._set_file_status(index, "Skipped")
+                    self.file_stages[index] = "Skipped"
+                    self._update_file_row(index, stage="Skipped", status="Skipped")
             self.status_var.set(
                 f"Stopped: {self.completed_count} done, "
                 f"{self.failed_count} failed, {self.stopped_count} stopped"
             )
             self._set_running(False)
+            self._update_progress(self._overall_progress(), "Batch stopped")
             self.worker = None
             self._append_log("\n=== BabelDOC batch stopped ===\n")
         elif kind == "error":
@@ -1127,6 +1263,113 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self.file_progress.get(index, 0.0) for index in range(self.batch_total)
         )
         return total_progress / self.batch_total
+
+    def _running_count(self) -> int:
+        with self.process_lock:
+            return sum(1 for process in self.processes.values() if process.poll() is None)
+
+    def _format_number(self, value: int | float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{int(value):,}"
+
+    def _normalize_token_usage(self, event: dict) -> dict[str, int]:
+        usage = {}
+        for key in (
+            "total_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "cache_hit_prompt_tokens",
+            "term_total_tokens",
+            "term_prompt_tokens",
+            "term_completion_tokens",
+            "term_cache_hit_prompt_tokens",
+        ):
+            try:
+                usage[key] = max(0, int(event.get(key) or 0))
+            except (TypeError, ValueError):
+                usage[key] = 0
+        return usage
+
+    def _total_token_usage(self) -> dict[str, int]:
+        total = {
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_hit_prompt_tokens": 0,
+            "term_total_tokens": 0,
+            "term_prompt_tokens": 0,
+            "term_completion_tokens": 0,
+            "term_cache_hit_prompt_tokens": 0,
+        }
+        for usage in self.file_token_usage.values():
+            for key in total:
+                total[key] += usage.get(key, 0)
+        return total
+
+    def _token_usage_summary(self, usage: dict[str, int]) -> str:
+        return (
+            f"total {self._format_number(usage.get('total_tokens', 0))}, "
+            f"prompt {self._format_number(usage.get('prompt_tokens', 0))}, "
+            f"completion {self._format_number(usage.get('completion_tokens', 0))}, "
+            f"cache {self._format_number(usage.get('cache_hit_prompt_tokens', 0))}"
+        )
+
+    def _format_duration(self, seconds: float | None) -> str:
+        if seconds is None or seconds < 0:
+            return "--"
+        seconds = int(seconds)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+
+    def _estimated_remaining_seconds(self, percent: float) -> float | None:
+        if self.run_started_at <= 0 or percent <= 1:
+            return None
+        elapsed = time.time() - self.run_started_at
+        estimated_total = elapsed / (percent / 100)
+        remaining = estimated_total - elapsed
+        return max(0.0, remaining)
+
+    def _progress_detail_text(self, percent: float) -> str:
+        if self.batch_total <= 0 or self.run_started_at <= 0:
+            return ""
+        elapsed = time.time() - self.run_started_at
+        eta = self._estimated_remaining_seconds(percent)
+        running = self._running_count()
+        queued = max(
+            0,
+            self.batch_total
+            - self.completed_count
+            - self.failed_count
+            - self.stopped_count
+            - running,
+        )
+        token_usage = self._total_token_usage()
+        token_detail = ""
+        if token_usage["total_tokens"] or token_usage["term_total_tokens"]:
+            token_detail = (
+                f" | Tokens {self._format_number(token_usage['total_tokens'])} "
+                f"(prompt {self._format_number(token_usage['prompt_tokens'])}, "
+                f"completion {self._format_number(token_usage['completion_tokens'])}, "
+                f"cache {self._format_number(token_usage['cache_hit_prompt_tokens'])})"
+            )
+            if token_usage["term_total_tokens"]:
+                token_detail += (
+                    f" | Term tokens "
+                    f"{self._format_number(token_usage['term_total_tokens'])}"
+                )
+        return (
+            f"Elapsed {self._format_duration(elapsed)} | "
+            f"ETA {self._format_duration(eta)} | "
+            f"Done {self.completed_count}/{self.batch_total}, "
+            f"Failed {self.failed_count}, Running {running}, Queued {queued}"
+            f"{token_detail}"
+        )
 
     def _recent_outputs(self) -> list[Path]:
         directories = self.batch_output_dirs or (
@@ -1155,11 +1398,18 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         if running:
             self.status_var.set("Running...")
             self.open_button.configure(state=tk.DISABLED)
+        else:
+            self.progress_detail_var.set(self._progress_detail_text(self._overall_progress()))
 
     def _update_progress(self, percent: float, text: str) -> None:
         percent = max(0.0, min(100.0, percent))
         self.progress.configure(value=percent)
-        self.progress_text_var.set(f"{percent:.0f}%")
+        eta = self._estimated_remaining_seconds(percent)
+        if eta is None or percent >= 100:
+            self.progress_text_var.set(f"{percent:.0f}%")
+        else:
+            self.progress_text_var.set(f"{percent:.0f}% | ETA {self._format_duration(eta)}")
+        self.progress_detail_var.set(self._progress_detail_text(percent))
         if text:
             self.status_var.set(text)
 

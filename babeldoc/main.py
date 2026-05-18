@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -234,6 +236,11 @@ def create_parser():
         type=float,
         default=0.1,
         help="Progress report interval in seconds (default: 0.1)",
+    )
+    translation_group.add_argument(
+        "--progress-json",
+        action="store_true",
+        help="Emit machine-readable progress events to stdout.",
     )
     translation_group.add_argument(
         "--translate-table-text",
@@ -686,6 +693,7 @@ async def main():
     for file in pending_files:
         # 清理文件路径，去除两端的引号
         file = file.strip("\"'")
+        token_usage_before = snapshot_translator_token_usage(translator)
         # 创建配置对象
         config = TranslationConfig(
             input_file=file,
@@ -748,9 +756,12 @@ async def main():
 
         getattr(doc_layout_model, "init_font_mapper", nop)(config)
         # Create progress handler
-        progress_context, progress_handler = create_progress_handler(
-            config, show_log=False
-        )
+        if args.progress_json:
+            progress_context, progress_handler = create_json_progress_handler()
+        else:
+            progress_context, progress_handler = create_progress_handler(
+                config, show_log=False
+            )
 
         # 开始翻译
         with progress_context:
@@ -772,6 +783,24 @@ async def main():
         total_term_extraction_cache_hit_prompt_tokens += usage[
             "cache_hit_prompt_tokens"
         ]
+        if args.progress_json:
+            token_usage = diff_token_usage(
+                token_usage_before,
+                snapshot_translator_token_usage(translator),
+            )
+            emit_json_progress_event(
+                {
+                    "type": "token_usage",
+                    "file": file,
+                    **token_usage,
+                    "term_total_tokens": usage["total_tokens"],
+                    "term_prompt_tokens": usage["prompt_tokens"],
+                    "term_completion_tokens": usage["completion_tokens"],
+                    "term_cache_hit_prompt_tokens": usage[
+                        "cache_hit_prompt_tokens"
+                    ],
+                }
+            )
     logger.info(f"Total tokens: {translator.token_count.value}")
     logger.info(f"Prompt tokens: {translator.prompt_token_count.value}")
     logger.info(f"Completion tokens: {translator.completion_token_count.value}")
@@ -793,6 +822,26 @@ async def main():
             term_extraction_translator.completion_token_count.value,
             term_extraction_translator.cache_hit_prompt_token_count.value,
         )
+
+
+def snapshot_translator_token_usage(translator) -> dict[str, int]:
+    return {
+        "total_tokens": getattr(translator.token_count, "value", 0),
+        "prompt_tokens": getattr(translator.prompt_token_count, "value", 0),
+        "completion_tokens": getattr(translator.completion_token_count, "value", 0),
+        "cache_hit_prompt_tokens": getattr(
+            translator.cache_hit_prompt_token_count,
+            "value",
+            0,
+        ),
+    }
+
+
+def diff_token_usage(
+    before: dict[str, int],
+    after: dict[str, int],
+) -> dict[str, int]:
+    return {key: max(0, after.get(key, 0) - before.get(key, 0)) for key in after}
 
 
 def create_progress_handler(
@@ -875,6 +924,45 @@ def create_progress_handler(
                 pbar.refresh()
 
         return pbar, progress_handler
+
+
+def create_json_progress_handler():
+    """Create a progress handler that prints one JSON event per line."""
+    progress_keys = {
+        "type",
+        "stage",
+        "stage_progress",
+        "stage_current",
+        "stage_total",
+        "overall_progress",
+        "part_index",
+        "total_parts",
+    }
+
+    def progress_handler(event):
+        event_type = event.get("type")
+        if event_type not in {
+            "progress_start",
+            "progress_update",
+            "progress_end",
+            "finish",
+            "error",
+        }:
+            return
+        payload = {key: event[key] for key in progress_keys if key in event}
+        if event_type == "error":
+            payload["error"] = str(event.get("error", ""))
+        emit_json_progress_event(payload)
+
+    return contextlib.nullcontext(), progress_handler
+
+
+def emit_json_progress_event(payload: dict[str, Any]) -> None:
+    print(
+        "BABELDOC_PROGRESS_JSON "
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        flush=True,
+    )
 
 
 # for backward compatibility
