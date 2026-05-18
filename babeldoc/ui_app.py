@@ -213,6 +213,7 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.run_started_at = 0.0
         self.completed_count = 0
         self.failed_count = 0
+        self.batch_output_dirs: list[Path] = []
 
         self._configure_style()
         self._build_vars()
@@ -314,13 +315,13 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             style="Title.TLabel",
             font=("Segoe UI", 10),
         ).grid(row=1, column=1, sticky="w")
+        self._build_actions(header)
 
         left = ttk.Frame(shell, style="Surface.TFrame", padding=14)
         left.grid(row=1, column=0, sticky="ns", padx=(0, 14))
         left.columnconfigure(0, weight=1)
 
         self._build_settings(left)
-        self._build_actions(left)
 
         right = ttk.Frame(shell)
         right.grid(row=1, column=1, sticky="nsew")
@@ -421,29 +422,29 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self._refresh_output_controls()
 
     def _build_actions(self, parent: ttk.Frame) -> None:
-        actions = ttk.Frame(parent, style="Surface.TFrame")
-        actions.grid(row=3, column=0, sticky="ew", pady=(14, 0))
-        actions.columnconfigure(0, weight=1)
+        actions = ttk.Frame(parent)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.columnconfigure(1, weight=1)
         self.save_button = ttk.Button(actions, text="Save settings", command=self._save)
-        self.save_button.grid(row=0, column=0, sticky="ew")
+        self.save_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.start_button = ttk.Button(
             actions,
             text="Start batch",
             style="Accent.TButton",
             command=self._start_translation,
         )
-        self.start_button.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.start_button.grid(row=0, column=1, sticky="w", padx=(0, 8))
         self.stop_button = ttk.Button(
             actions, text="Stop", command=self._stop_translation, state=tk.DISABLED
         )
-        self.stop_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.stop_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self.open_button = ttk.Button(
             actions,
             text="Open output folder",
             command=self._open_output_folder,
             state=tk.DISABLED,
         )
-        self.open_button.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.open_button.grid(row=0, column=3, sticky="e")
 
     def _build_file_panel(self, parent: ttk.Frame) -> None:
         panel = ttk.LabelFrame(parent, text="Input PDFs", style="Panel.TLabelframe", padding=12)
@@ -694,6 +695,7 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self.failed_count = 0
             self.run_started_at = time.time()
             self.last_output_dir = output_dir or pdfs[0].parent
+            self.batch_output_dirs = self._batch_output_dirs(pdfs, output_dir)
             self._set_running(True)
             self._append_log("\n=== BabelDOC batch started ===\n")
             self._append_log(
@@ -706,7 +708,20 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         except Exception as exc:
             messagebox.showerror("Cannot start", str(exc))
 
+    def _batch_output_dirs(self, pdfs: list[Path], output_dir: Path | None) -> list[Path]:
+        dirs = [output_dir] if output_dir is not None else [path.parent for path in pdfs]
+        unique_dirs = []
+        seen = set()
+        for directory in dirs:
+            resolved = directory.resolve()
+            key = str(resolved).lower()
+            if key not in seen:
+                seen.add(key)
+                unique_dirs.append(resolved)
+        return unique_dirs
+
     def _build_command(self, pdf_path: Path, output_dir: Path | None) -> list[str]:
+        effective_output_dir = output_dir or pdf_path.parent
         command = [
             sys.executable,
             "-m",
@@ -722,6 +737,8 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             str(max(1, int(self.qps_var.get() or 1))),
             "--working-dir",
             str(APP_DATA_DIR / "work"),
+            "--output",
+            str(effective_output_dir),
         ]
         if self.protocol_var.get() == "Responses API":
             command.append("--openai-use-responses")
@@ -729,8 +746,6 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             command.append("--no-mono")
         elif self.output_mode_var.get() == "mono":
             command.append("--no-dual")
-        if output_dir is not None:
-            command.extend(["--output", str(output_dir)])
         if self.ignore_cache_var.get():
             command.append("--ignore-cache")
         if self.no_auto_glossary_var.get():
@@ -744,7 +759,10 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             if self.stop_requested:
                 self.output_queue.put(("batch_stopped", None))
                 return
-            self.output_queue.put(("file_start", index, str(pdf_path)))
+            effective_output_dir = output_dir or pdf_path.parent
+            self.output_queue.put(
+                ("file_start", index, str(pdf_path), str(effective_output_dir))
+            )
             return_code = self._run_one(self._build_command(pdf_path, output_dir), index)
             self.output_queue.put(("file_done", index, return_code))
             if return_code != 0:
@@ -848,11 +866,7 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         elif kind == "file_start":
             self.current_index = int(item[1])
             path = Path(item[2])
-            self.last_output_dir = (
-                Path(self.output_dir_var.get().strip())
-                if self.output_target_var.get() == "custom"
-                else path.parent
-            )
+            self.last_output_dir = Path(item[3]) if len(item) > 3 else path.parent
             self._set_file_status(self.current_index, "Running")
             self._update_progress(self._file_base_progress(), f"Running {path.name}")
             self._append_log(f"\n--- [{self.current_index + 1}/{self.batch_total}] {path} ---\n")
@@ -882,13 +896,18 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self._append_log(f"\nError: {item[1]}\n")
 
     def _recent_outputs(self) -> list[Path]:
-        if self.last_output_dir is None or not self.last_output_dir.exists():
+        directories = self.batch_output_dirs or (
+            [self.last_output_dir] if self.last_output_dir is not None else []
+        )
+        directories = [directory for directory in directories if directory.exists()]
+        if not directories:
             return []
         threshold = self.run_started_at - 5
         return sorted(
             [
                 path
-                for path in self.last_output_dir.glob("*.pdf")
+                for directory in directories
+                for path in directory.glob("*.pdf")
                 if path.stat().st_mtime >= threshold
             ],
             key=lambda p: p.stat().st_mtime,
