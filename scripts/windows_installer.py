@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import os
 import queue
@@ -205,6 +206,9 @@ if os.name == "nt":
     ID_CLOSE = 1003
     MSG_INSTALL_DONE = WM_APP + 1
     MSG_LOG = WM_APP + 2
+    S_OK = 0
+    S_FALSE = 1
+    RPC_E_CHANGED_MODE = ctypes.c_long(0x80010106).value
 
     def _int_resource(resource_id: int) -> ctypes.c_void_p:
         return ctypes.c_void_p(resource_id)
@@ -303,6 +307,10 @@ if os.name == "nt":
     shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
     shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
     shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    ole32.OleInitialize.argtypes = [ctypes.c_void_p]
+    ole32.OleInitialize.restype = ctypes.c_long
+    ole32.OleUninitialize.argtypes = []
+    ole32.OleUninitialize.restype = None
     ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
     ole32.CoTaskMemFree.restype = None
 
@@ -321,14 +329,31 @@ if os.name == "nt":
             self.close_button = None
             self.installing = False
             self.install_succeeded = False
+            self.ole_initialized = False
             self.log_queue: queue.Queue[str] = queue.Queue()
 
         def run(self) -> int:
-            self._init_common_controls()
-            self._register_class()
-            self._create_window()
-            self._message_loop()
-            return 0 if self.install_succeeded else 1
+            try:
+                self._init_ole()
+                self._init_common_controls()
+                self._register_class()
+                self._create_window()
+                self._message_loop()
+                return 0 if self.install_succeeded else 1
+            finally:
+                self._uninit_ole()
+
+        def _init_ole(self) -> None:
+            result = ole32.OleInitialize(None)
+            if result in (S_OK, S_FALSE):
+                self.ole_initialized = True
+            elif result != RPC_E_CHANGED_MODE:
+                raise ctypes.WinError(result)
+
+        def _uninit_ole(self) -> None:
+            if self.ole_initialized:
+                ole32.OleUninitialize()
+                self.ole_initialized = False
 
         def _init_common_controls(self) -> None:
             try:
@@ -525,18 +550,93 @@ if os.name == "nt":
         def _choose_folder(self) -> None:
             if self.installing:
                 return
-            display = ctypes.create_unicode_buffer(MAX_PATH)
-            browse = BROWSEINFO()
-            browse.hwndOwner = self.hwnd
-            browse.pszDisplayName = display
-            browse.lpszTitle = "Choose the BabelDOC UI installation folder"
-            browse.ulFlags = BIF_USENEWUI
-            pidl = shell32.SHBrowseForFolderW(ctypes.byref(browse))
-            if pidl:
-                path_buffer = ctypes.create_unicode_buffer(MAX_PATH)
-                if shell32.SHGetPathFromIDListW(pidl, path_buffer):
-                    user32.SetWindowTextW(self.path_edit, path_buffer.value)
-                ole32.CoTaskMemFree(pidl)
+            self.append_log("Opening folder picker...")
+            selected = None
+            try:
+                selected = self._choose_folder_with_powershell()
+            except Exception as exc:
+                self.append_log(f"PowerShell folder picker failed: {exc}")
+                try:
+                    selected = self._choose_folder_native()
+                except Exception as native_exc:
+                    self._message(
+                        f"Could not open folder picker: {native_exc}",
+                        "Browse failed",
+                    )
+                    return
+
+            if selected:
+                user32.SetWindowTextW(self.path_edit, selected)
+                self.append_log(f"Selected folder: {selected}")
+            else:
+                self.append_log("Folder picker was cancelled.")
+
+        def _choose_folder_with_powershell(self) -> str | None:
+            script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = "Choose the BabelDOC UI installation folder"
+$dialog.ShowNewFolderButton = $true
+if ($env:BABELDOC_INSTALL_SELECTED_PATH -and (Test-Path -LiteralPath $env:BABELDOC_INSTALL_SELECTED_PATH)) {
+    $dialog.SelectedPath = $env:BABELDOC_INSTALL_SELECTED_PATH
+}
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::Out.WriteLine($dialog.SelectedPath)
+}
+"""
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            env = os.environ.copy()
+            env["BABELDOC_INSTALL_SELECTED_PATH"] = self._get_window_text(
+                self.path_edit
+            )
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-STA",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                env=env,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip() or "PowerShell failed")
+            lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+            return lines[-1] if lines else None
+
+        def _choose_folder_native(self) -> str | None:
+            try:
+                display = ctypes.create_unicode_buffer(MAX_PATH)
+                browse = BROWSEINFO()
+                browse.hwndOwner = self.hwnd
+                browse.pszDisplayName = display
+                browse.lpszTitle = "Choose the BabelDOC UI installation folder"
+                browse.ulFlags = BIF_USENEWUI
+                pidl = shell32.SHBrowseForFolderW(ctypes.byref(browse))
+                if not pidl:
+                    return None
+                try:
+                    path_buffer = ctypes.create_unicode_buffer(MAX_PATH)
+                    if shell32.SHGetPathFromIDListW(pidl, path_buffer):
+                        return path_buffer.value
+                    raise RuntimeError("The selected folder path could not be read.")
+                finally:
+                    ole32.CoTaskMemFree(pidl)
+            except Exception:
+                raise
 
         def _start_install(self) -> None:
             if self.installing:
