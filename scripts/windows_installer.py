@@ -120,6 +120,7 @@ if os.name == "nt":
     HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HANDLE)
     HGDIOBJ = getattr(wintypes, "HGDIOBJ", wintypes.HANDLE)
     HMODULE = getattr(wintypes, "HMODULE", wintypes.HANDLE)
+    WPARAM_MAX = (1 << (ctypes.sizeof(wintypes.WPARAM) * 8)) - 1
 
     LRESULT = ctypes.c_ssize_t
     WNDPROC = ctypes.WINFUNCTYPE(
@@ -205,13 +206,105 @@ if os.name == "nt":
     MSG_INSTALL_DONE = WM_APP + 1
     MSG_LOG = WM_APP + 2
 
+    def _int_resource(resource_id: int) -> ctypes.c_void_p:
+        return ctypes.c_void_p(resource_id)
+
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = HMODULE
+    user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
     user32.LoadCursorW.restype = HCURSOR
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
     user32.LoadIconW.restype = wintypes.HICON
+    user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+    user32.RegisterClassExW.restype = ctypes.c_ushort
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        wintypes.HMENU,
+        wintypes.HINSTANCE,
+        ctypes.c_void_p,
+    ]
     user32.CreateWindowExW.restype = wintypes.HWND
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.UpdateWindow.argtypes = [wintypes.HWND]
+    user32.UpdateWindow.restype = wintypes.BOOL
+    user32.SendMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.SendMessageW.restype = LRESULT
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG),
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = LRESULT
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.PostQuitMessage.restype = None
+    user32.DefWindowProcW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
     user32.DefWindowProcW.restype = LRESULT
+    user32.PostMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.SetWindowTextW.restype = wintypes.BOOL
+    user32.EnableWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+    user32.EnableWindow.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [
+        wintypes.HWND,
+        wintypes.LPWSTR,
+        ctypes.c_int,
+    ]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.DestroyWindow.restype = wintypes.BOOL
+    user32.MessageBoxW.argtypes = [
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+    ]
+    user32.MessageBoxW.restype = ctypes.c_int
+    gdi32.GetStockObject.argtypes = [ctypes.c_int]
     gdi32.GetStockObject.restype = HGDIOBJ
+    comctl32.InitCommonControlsEx.argtypes = [
+        ctypes.POINTER(INITCOMMONCONTROLSEX)
+    ]
+    comctl32.InitCommonControlsEx.restype = wintypes.BOOL
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFO)]
     shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
 
     class WindowsInstallerGui:
         def __init__(self) -> None:
@@ -251,9 +344,9 @@ if os.name == "nt":
             wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
             wc.lpfnWndProc = self.wndproc
             wc.hInstance = self.hinstance
-            wc.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+            wc.hIcon = user32.LoadIconW(None, _int_resource(IDI_APPLICATION))
             wc.hIconSm = wc.hIcon
-            wc.hCursor = user32.LoadCursorW(None, IDC_ARROW)
+            wc.hCursor = user32.LoadCursorW(None, _int_resource(IDC_ARROW))
             wc.hbrBackground = wintypes.HBRUSH(COLOR_BTNFACE + 1)
             wc.lpszClassName = self.class_name
             user32.RegisterClassExW(ctypes.byref(wc))
@@ -515,8 +608,13 @@ if os.name == "nt":
             clean = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
             if not clean.endswith("\r\n"):
                 clean += "\r\n"
-            user32.SendMessageW(self.log_edit, EM_SETSEL, -1, -1)
-            user32.SendMessageW(self.log_edit, EM_REPLACESEL, False, clean)
+            user32.SendMessageW(self.log_edit, EM_SETSEL, WPARAM_MAX, -1)
+            user32.SendMessageW(
+                self.log_edit,
+                EM_REPLACESEL,
+                0,
+                ctypes.cast(ctypes.c_wchar_p(clean), ctypes.c_void_p).value,
+            )
 
         def _get_window_text(self, hwnd) -> str:
             length = user32.GetWindowTextLengthW(hwnd)
