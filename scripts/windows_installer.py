@@ -117,6 +117,10 @@ if os.name == "nt":
     comctl32 = ctypes.windll.comctl32
     gdi32 = ctypes.windll.gdi32
 
+    HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HANDLE)
+    HGDIOBJ = getattr(wintypes, "HGDIOBJ", wintypes.HANDLE)
+    HMODULE = getattr(wintypes, "HMODULE", wintypes.HANDLE)
+
     LRESULT = ctypes.c_ssize_t
     WNDPROC = ctypes.WINFUNCTYPE(
         LRESULT,
@@ -135,7 +139,7 @@ if os.name == "nt":
             ("cbWndExtra", ctypes.c_int),
             ("hInstance", wintypes.HINSTANCE),
             ("hIcon", wintypes.HICON),
-            ("hCursor", wintypes.HCURSOR),
+            ("hCursor", HCURSOR),
             ("hbrBackground", wintypes.HBRUSH),
             ("lpszMenuName", wintypes.LPCWSTR),
             ("lpszClassName", wintypes.LPCWSTR),
@@ -201,12 +205,12 @@ if os.name == "nt":
     MSG_INSTALL_DONE = WM_APP + 1
     MSG_LOG = WM_APP + 2
 
-    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-    user32.LoadCursorW.restype = wintypes.HCURSOR
+    kernel32.GetModuleHandleW.restype = HMODULE
+    user32.LoadCursorW.restype = HCURSOR
     user32.LoadIconW.restype = wintypes.HICON
     user32.CreateWindowExW.restype = wintypes.HWND
     user32.DefWindowProcW.restype = LRESULT
-    gdi32.GetStockObject.restype = wintypes.HGDIOBJ
+    gdi32.GetStockObject.restype = HGDIOBJ
     shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
 
     class WindowsInstallerGui:
