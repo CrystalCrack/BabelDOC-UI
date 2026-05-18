@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 import ctypes
 import ctypes.wintypes
+import hashlib
 import json
 import os
 import queue
@@ -185,11 +189,28 @@ class UiSettings:
     output_dir: str = ""
     files: list[str] | None = None
     qps: int = 1
+    parallel_files: int = 1
+    pool_max_workers: int = 0
     ignore_cache: bool = True
     no_auto_extract_glossary: bool = True
     no_send_temperature: bool = True
     api_key_storage: str = "none"
     api_key_blob: str = ""
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    base_url: str
+    model: str
+    protocol: str
+    output_mode: str
+    qps: int
+    parallel_files: int
+    pool_max_workers: int
+    ignore_cache: bool
+    no_auto_extract_glossary: bool
+    no_send_temperature: bool
+    api_key: str
 
 
 class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
@@ -203,7 +224,9 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.settings = self._load_settings()
         self.api_key = self._load_api_key()
         self.file_paths: list[str] = unique_paths(self.settings.files or [])
-        self.process: subprocess.Popen | None = None
+        self.processes: dict[int, subprocess.Popen] = {}
+        self.process_lock = threading.Lock()
+        self.env_lock = threading.Lock()
         self.worker: threading.Thread | None = None
         self.output_queue: queue.Queue = queue.Queue()
         self.stop_requested = False
@@ -213,6 +236,9 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.run_started_at = 0.0
         self.completed_count = 0
         self.failed_count = 0
+        self.stopped_count = 0
+        self.finished_indices: set[int] = set()
+        self.file_progress: dict[int, float] = {}
         self.batch_output_dirs: list[Path] = []
 
         self._configure_style()
@@ -266,6 +292,12 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.output_target_var = tk.StringVar(value=self.settings.output_target)
         self.output_dir_var = tk.StringVar(value=self.settings.output_dir)
         self.qps_var = tk.IntVar(value=max(1, int(self.settings.qps or 1)))
+        self.parallel_files_var = tk.IntVar(
+            value=max(1, int(self.settings.parallel_files or 1))
+        )
+        self.pool_workers_var = tk.IntVar(
+            value=max(0, int(self.settings.pool_max_workers or 0))
+        )
         self.ignore_cache_var = tk.BooleanVar(value=self.settings.ignore_cache)
         self.no_auto_glossary_var = tk.BooleanVar(
             value=self.settings.no_auto_extract_glossary
@@ -399,25 +431,42 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
         options = ttk.LabelFrame(parent, text="Run options", style="Panel.TLabelframe", padding=12)
         options.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        options.columnconfigure(1, weight=1)
         ttk.Label(options, text="QPS").grid(row=0, column=0, sticky="w")
         ttk.Spinbox(options, from_=1, to=20, textvariable=self.qps_var, width=8).grid(
             row=0, column=1, sticky="w", padx=(10, 0)
         )
+        ttk.Label(options, text="Parallel PDFs").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(
+            options,
+            from_=1,
+            to=8,
+            textvariable=self.parallel_files_var,
+            width=8,
+        ).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
+        ttk.Label(options, text="Worker threads").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(
+            options,
+            from_=0,
+            to=64,
+            textvariable=self.pool_workers_var,
+            width=8,
+        ).grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
         ttk.Checkbutton(
             options,
             text="Ignore translation cache",
             variable=self.ignore_cache_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             options,
             text="Disable auto glossary",
             variable=self.no_auto_glossary_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             options,
             text="Do not send temperature",
             variable=self.no_temperature_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self._refresh_output_controls()
 
@@ -639,13 +688,33 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             output_target=self.output_target_var.get(),
             output_dir=self.output_dir_var.get().strip(),
             files=self.file_paths,
-            qps=max(1, int(self.qps_var.get() or 1)),
+            qps=self._int_var(self.qps_var, default=1, minimum=1, maximum=20),
+            parallel_files=self._int_var(
+                self.parallel_files_var, default=1, minimum=1, maximum=8
+            ),
+            pool_max_workers=self._int_var(
+                self.pool_workers_var, default=0, minimum=0, maximum=64
+            ),
             ignore_cache=self.ignore_cache_var.get(),
             no_auto_extract_glossary=self.no_auto_glossary_var.get(),
             no_send_temperature=self.no_temperature_var.get(),
             api_key_storage=storage,
             api_key_blob=blob,
         )
+
+    def _int_var(
+        self,
+        variable: tk.IntVar,
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            value = int(variable.get())
+        except (tk.TclError, TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
 
     def _save(self) -> None:
         try:
@@ -683,30 +752,58 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         return pdfs, output_dir
 
     def _start_translation(self) -> None:
-        if self.process is not None:
+        if self._is_running():
             return
         try:
             pdfs, output_dir = self._validate()
             self._save()
+            run_config = self._run_config_from_settings(
+                self.settings,
+                self.api_key_var.get().strip(),
+            )
             self.stop_requested = False
             self.current_index = 0
             self.batch_total = len(pdfs)
             self.completed_count = 0
             self.failed_count = 0
+            self.stopped_count = 0
+            self.finished_indices = set()
+            self.file_progress = {index: 0.0 for index in range(len(pdfs))}
             self.run_started_at = time.time()
             self.last_output_dir = output_dir or pdfs[0].parent
             self.batch_output_dirs = self._batch_output_dirs(pdfs, output_dir)
             self._set_running(True)
             self._append_log("\n=== BabelDOC batch started ===\n")
             self._append_log(
+                f"Parallel PDFs: {self._parallel_file_count(len(pdfs), run_config)}; "
+                f"QPS per PDF: {run_config.qps}.\n"
+            )
+            self._append_log(
                 "API key is passed through the child process environment, not the command line.\n"
             )
             self.worker = threading.Thread(
-                target=self._run_batch, args=(pdfs, output_dir), daemon=True
+                target=self._run_batch,
+                args=(pdfs, output_dir, run_config),
+                daemon=True,
             )
             self.worker.start()
         except Exception as exc:
             messagebox.showerror("Cannot start", str(exc))
+
+    def _run_config_from_settings(self, settings: UiSettings, api_key: str) -> RunConfig:
+        return RunConfig(
+            base_url=settings.base_url,
+            model=settings.model,
+            protocol=settings.protocol,
+            output_mode=settings.output_mode,
+            qps=settings.qps,
+            parallel_files=settings.parallel_files,
+            pool_max_workers=settings.pool_max_workers,
+            ignore_cache=settings.ignore_cache,
+            no_auto_extract_glossary=settings.no_auto_extract_glossary,
+            no_send_temperature=settings.no_send_temperature,
+            api_key=api_key,
+        )
 
     def _batch_output_dirs(self, pdfs: list[Path], output_dir: Path | None) -> list[Path]:
         dirs = [output_dir] if output_dir is not None else [path.parent for path in pdfs]
@@ -720,8 +817,16 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 unique_dirs.append(resolved)
         return unique_dirs
 
-    def _build_command(self, pdf_path: Path, output_dir: Path | None) -> list[str]:
+    def _build_command(
+        self,
+        pdf_path: Path,
+        output_dir: Path | None,
+        file_index: int,
+        run_config: RunConfig,
+    ) -> list[str]:
         effective_output_dir = output_dir or pdf_path.parent
+        working_dir = self._working_dir_for(pdf_path, file_index)
+        working_dir.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,
             "-m",
@@ -730,48 +835,128 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             str(pdf_path),
             "--openai",
             "--openai-model",
-            self.model_var.get().strip(),
+            run_config.model,
             "--openai-base-url",
-            self.base_url_var.get().strip(),
+            run_config.base_url,
             "--qps",
-            str(max(1, int(self.qps_var.get() or 1))),
+            str(run_config.qps),
             "--working-dir",
-            str(APP_DATA_DIR / "work"),
+            str(working_dir),
             "--output",
             str(effective_output_dir),
         ]
-        if self.protocol_var.get() == "Responses API":
+        if run_config.pool_max_workers > 0:
+            command.extend(["--pool-max-workers", str(run_config.pool_max_workers)])
+        if run_config.protocol == "responses":
             command.append("--openai-use-responses")
-        if self.output_mode_var.get() == "dual":
+        if run_config.output_mode == "dual":
             command.append("--no-mono")
-        elif self.output_mode_var.get() == "mono":
+        elif run_config.output_mode == "mono":
             command.append("--no-dual")
-        if self.ignore_cache_var.get():
+        if run_config.ignore_cache:
             command.append("--ignore-cache")
-        if self.no_auto_glossary_var.get():
+        if run_config.no_auto_extract_glossary:
             command.append("--no-auto-extract-glossary")
-        if self.no_temperature_var.get():
+        if run_config.no_send_temperature:
             command.append("--no-send-temperature")
         return command
 
-    def _run_batch(self, pdfs: list[Path], output_dir: Path | None) -> None:
-        for index, pdf_path in enumerate(pdfs):
-            if self.stop_requested:
-                self.output_queue.put(("batch_stopped", None))
-                return
-            effective_output_dir = output_dir or pdf_path.parent
-            self.output_queue.put(
-                ("file_start", index, str(pdf_path), str(effective_output_dir))
-            )
-            return_code = self._run_one(self._build_command(pdf_path, output_dir), index)
-            self.output_queue.put(("file_done", index, return_code))
-            if return_code != 0:
-                self.failed_count += 1
-            else:
-                self.completed_count += 1
-        self.output_queue.put(("batch_done", None))
+    def _working_dir_for(self, pdf_path: Path, file_index: int) -> Path:
+        normalized = str(pdf_path.resolve()).encode("utf-8", errors="surrogatepass")
+        digest = hashlib.sha1(normalized).hexdigest()[:10]
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", pdf_path.stem).strip("._")
+        safe_name = (safe_name or "pdf")[:42]
+        return APP_DATA_DIR / "work" / f"{file_index + 1:03d}-{safe_name}-{digest}"
 
-    def _run_one(self, command: list[str], file_index: int) -> int:
+    def _parallel_file_count(self, total_files: int, run_config: RunConfig) -> int:
+        return min(max(1, total_files), run_config.parallel_files)
+
+    def _run_batch(
+        self,
+        pdfs: list[Path],
+        output_dir: Path | None,
+        run_config: RunConfig,
+    ) -> None:
+        max_workers = self._parallel_file_count(len(pdfs), run_config)
+        next_index = 0
+        futures = {}
+
+        def submit_next(executor: ThreadPoolExecutor) -> bool:
+            nonlocal next_index
+            if self.stop_requested or next_index >= len(pdfs):
+                return False
+            index = next_index
+            next_index += 1
+            futures[
+                executor.submit(
+                    self._run_file_task,
+                    index,
+                    pdfs[index],
+                    output_dir,
+                    run_config,
+                )
+            ] = index
+            return True
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for _ in range(max_workers):
+                submit_next(executor)
+
+            while futures:
+                done, _pending = wait(
+                    futures,
+                    timeout=0.2,
+                    return_when=FIRST_COMPLETED,
+                )
+                if self.stop_requested:
+                    self._terminate_processes()
+                    for future in futures:
+                        future.cancel()
+                if not done:
+                    continue
+                for future in done:
+                    index = futures.pop(future)
+                    if future.cancelled():
+                        self.output_queue.put(("file_done", index, 130, True))
+                        continue
+                    try:
+                        return_code = int(future.result())
+                    except Exception as exc:
+                        self.output_queue.put(("error", str(exc)))
+                        return_code = 1
+                    self.output_queue.put(
+                        ("file_done", index, return_code, self.stop_requested and return_code != 0)
+                    )
+                    if not self.stop_requested:
+                        submit_next(executor)
+
+        if self.stop_requested:
+            self.output_queue.put(("batch_stopped", None))
+        else:
+            self.output_queue.put(("batch_done", None))
+
+    def _run_file_task(
+        self,
+        file_index: int,
+        pdf_path: Path,
+        output_dir: Path | None,
+        run_config: RunConfig,
+    ) -> int:
+        if self.stop_requested:
+            return 130
+        effective_output_dir = output_dir or pdf_path.parent
+        self.output_queue.put(
+            ("file_start", file_index, str(pdf_path), str(effective_output_dir))
+        )
+        command = self._build_command(pdf_path, output_dir, file_index, run_config)
+        return self._run_one(command, file_index, run_config)
+
+    def _run_one(
+        self,
+        command: list[str],
+        file_index: int,
+        run_config: RunConfig,
+    ) -> int:
         env = os.environ.copy()
         app_home = APP_DATA_DIR / "home"
         app_home.mkdir(parents=True, exist_ok=True)
@@ -779,61 +964,59 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         env["USERPROFILE"] = str(app_home)
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
-        env["BABELDOC_OPENAI_API_KEY"] = self.api_key_var.get().strip()
+        env["BABELDOC_OPENAI_API_KEY"] = run_config.api_key
         git_config = APP_DATA_DIR / "gitconfig"
-        git_config.write_text(
-            f"[safe]\n\tdirectory = {PROJECT_ROOT.as_posix()}\n",
-            encoding="utf-8",
-        )
+        with self.env_lock:
+            git_config.write_text(
+                f"[safe]\n\tdirectory = {PROJECT_ROOT.as_posix()}\n",
+                encoding="utf-8",
+            )
         env["GIT_CONFIG_GLOBAL"] = str(git_config)
 
+        process = None
         try:
-            self.process = subprocess.Popen(
-                command,
-                cwd=str(PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=env,
-            )
-            assert self.process.stdout is not None
-            for line in self.process.stdout:
-                self.output_queue.put(("log", line))
+            popen_kwargs = {
+                "cwd": str(PROJECT_ROOT),
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
+                "env": env,
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            process = subprocess.Popen(command, **popen_kwargs)
+            with self.process_lock:
+                self.processes[file_index] = process
+                if self.stop_requested and process.poll() is None:
+                    process.terminate()
+            assert process.stdout is not None
+            prefix = f"[{file_index + 1}/{self.batch_total}] "
+            for line in process.stdout:
+                self.output_queue.put(("log", f"{prefix}{line}"))
                 self._queue_progress_from_line(line, file_index)
-            return self.process.wait()
+            return process.wait()
         except Exception as exc:
-            self.output_queue.put(("error", str(exc)))
+            self.output_queue.put(("error", f"[{file_index + 1}] {exc}"))
             return 1
         finally:
-            self.process = None
+            if process is not None:
+                with self.process_lock:
+                    if self.processes.get(file_index) is process:
+                        del self.processes[file_index]
 
     def _queue_progress_from_line(self, line: str, file_index: int) -> None:
         for stage_index, stage in enumerate(STAGES):
             if stage in line:
-                base = self._file_base_progress(file_index)
-                stage_width = 100 / max(1, self.batch_total) / len(STAGES)
-                percent = min(99.0, base + stage_index * stage_width)
-                self.output_queue.put(("progress", percent, stage))
+                percent = min(95.0, ((stage_index + 1) / len(STAGES)) * 90)
+                self.output_queue.put(("progress", file_index, percent, stage))
                 return
         if "Translation completed" in line:
-            self.output_queue.put(
-                (
-                    "progress",
-                    self._file_base_progress(file_index) + 80 / max(1, self.batch_total),
-                    "Translation completed",
-                )
-            )
+            self.output_queue.put(("progress", file_index, 80.0, "Translation completed"))
         elif "finish translate" in line:
-            self.output_queue.put(
-                (
-                    "progress",
-                    self._file_base_progress(file_index) + 98 / max(1, self.batch_total),
-                    "Saving output",
-                )
-            )
+            self.output_queue.put(("progress", file_index, 98.0, "Saving output"))
 
     def _file_base_progress(self, file_index: int | None = None) -> float:
         if self.batch_total <= 0:
@@ -844,9 +1027,25 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
     def _stop_translation(self) -> None:
         self.stop_requested = True
-        if self.process is not None:
+        if self._is_running():
             self._append_log("\nStopping translation...\n")
-            self.process.terminate()
+            self._terminate_processes()
+
+    def _terminate_processes(self) -> None:
+        with self.process_lock:
+            processes = list(self.processes.values())
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+
+    def _is_running(self) -> bool:
+        if self.worker is not None and self.worker.is_alive():
+            return True
+        with self.process_lock:
+            return any(process.poll() is None for process in self.processes.values())
 
     def _pump_output(self) -> None:
         try:
@@ -862,38 +1061,72 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         if kind == "log":
             self._append_log(item[1])
         elif kind == "progress":
-            self._update_progress(float(item[1]), str(item[2]))
+            index = int(item[1])
+            file_percent = float(item[2])
+            stage = str(item[3])
+            self.file_progress[index] = max(
+                self.file_progress.get(index, 0.0),
+                file_percent,
+            )
+            self._update_progress(
+                self._overall_progress(),
+                f"[{index + 1}/{self.batch_total}] {stage}",
+            )
         elif kind == "file_start":
             self.current_index = int(item[1])
             path = Path(item[2])
             self.last_output_dir = Path(item[3]) if len(item) > 3 else path.parent
             self._set_file_status(self.current_index, "Running")
-            self._update_progress(self._file_base_progress(), f"Running {path.name}")
+            self.file_progress.setdefault(self.current_index, 0.0)
+            self._update_progress(self._overall_progress(), f"Running {path.name}")
             self._append_log(f"\n--- [{self.current_index + 1}/{self.batch_total}] {path} ---\n")
         elif kind == "file_done":
             index = int(item[1])
             return_code = int(item[2])
+            stopped = bool(item[3]) if len(item) > 3 else False
+            self.file_progress[index] = 100.0
+            self.finished_indices.add(index)
             if return_code == 0:
+                self.completed_count += 1
                 self._set_file_status(index, "Done")
+            elif stopped:
+                self.stopped_count += 1
+                self._set_file_status(index, "Stopped")
             else:
+                self.failed_count += 1
                 self._set_file_status(index, f"Failed ({return_code})")
-            percent = ((index + 1) / max(1, self.batch_total)) * 100
-            self._update_progress(percent, "File finished")
+            self._update_progress(self._overall_progress(), "File finished")
         elif kind == "batch_done":
             self.status_var.set(
                 f"Finished: {self.completed_count} done, {self.failed_count} failed"
             )
             self._set_running(False)
+            self.worker = None
             self.open_button.configure(state=tk.NORMAL)
             self._append_log("\n=== BabelDOC batch finished ===\n")
             for path in self._recent_outputs():
                 self._append_log(f"Output: {path}\n")
         elif kind == "batch_stopped":
-            self.status_var.set("Stopped")
+            for index in range(self.batch_total):
+                if index not in self.finished_indices:
+                    self._set_file_status(index, "Skipped")
+            self.status_var.set(
+                f"Stopped: {self.completed_count} done, "
+                f"{self.failed_count} failed, {self.stopped_count} stopped"
+            )
             self._set_running(False)
+            self.worker = None
             self._append_log("\n=== BabelDOC batch stopped ===\n")
         elif kind == "error":
             self._append_log(f"\nError: {item[1]}\n")
+
+    def _overall_progress(self) -> float:
+        if self.batch_total <= 0:
+            return 0.0
+        total_progress = sum(
+            self.file_progress.get(index, 0.0) for index in range(self.batch_total)
+        )
+        return total_progress / self.batch_total
 
     def _recent_outputs(self) -> list[Path]:
         directories = self.batch_output_dirs or (
@@ -945,7 +1178,7 @@ class BabelDocUi(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             os.startfile(path)
 
     def _on_close(self) -> None:
-        if self.process is not None:
+        if self._is_running():
             if not messagebox.askyesno(
                 "Translation is running",
                 "A translation is still running. Stop it and exit?",
