@@ -4,6 +4,7 @@ import base64
 import ctypes
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import zipfile
 from ctypes import wintypes
+from locale import getpreferredencoding
 from pathlib import Path
 from typing import Callable
 
@@ -18,6 +20,33 @@ from typing import Callable
 APP_NAME = "BabelDOC UI"
 INSTALL_DIR_NAME = "BabelDOC-UI"
 PAYLOAD_NAME = "BabelDOC-UI.zip"
+
+
+def _decode_process_output(data: bytes) -> str:
+    if not data:
+        return ""
+    encodings = [
+        "utf-8-sig",
+        getpreferredencoding(False),
+        "mbcs",
+        "gbk",
+        "cp936",
+    ]
+    seen = set()
+    for encoding in encodings:
+        if not encoding or encoding.lower() in seen:
+            continue
+        seen.add(encoding.lower())
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _clean_log_text(text: str) -> str:
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+    return "".join(char for char in text if char in "\r\n\t" or ord(char) >= 32)
 
 
 def _resource_dir() -> Path:
@@ -46,28 +75,36 @@ def _run_setup(install_dir: Path, log: Callable[[str], None]) -> None:
     if not setup_script.exists():
         raise FileNotFoundError(f"Setup script not found: {setup_script}")
 
+    setup_command = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "$OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "& $env:BABELDOC_SETUP_SCRIPT"
+    )
+    encoded_command = base64.b64encode(setup_command.encode("utf-16le")).decode("ascii")
     command = [
         "powershell",
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
-        "-File",
-        str(setup_script),
+        "-EncodedCommand",
+        encoded_command,
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    env = os.environ.copy()
+    env["BABELDOC_SETUP_SCRIPT"] = str(setup_script)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     process = subprocess.Popen(
         command,
         cwd=str(install_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         creationflags=creationflags,
+        env=env,
     )
     assert process.stdout is not None
     for line in process.stdout:
-        log(line)
+        log(_decode_process_output(line))
     return_code = process.wait()
     if return_code != 0:
         raise RuntimeError(f"Setup failed with exit code {return_code}")
@@ -193,6 +230,12 @@ if os.name == "nt":
     PBM_SETMARQUEE = WM_USER + 10
     COLOR_BTNFACE = 15
     DEFAULT_GUI_FONT = 17
+    DEFAULT_CHARSET = 1
+    OUT_DEFAULT_PRECIS = 0
+    CLIP_DEFAULT_PRECIS = 0
+    CLEARTYPE_QUALITY = 5
+    DEFAULT_PITCH = 0
+    FW_NORMAL = 400
     IDC_ARROW = 32512
     IDI_APPLICATION = 32512
     ICC_PROGRESS_CLASS = 0x00000020
@@ -299,6 +342,25 @@ if os.name == "nt":
     user32.MessageBoxW.restype = ctypes.c_int
     gdi32.GetStockObject.argtypes = [ctypes.c_int]
     gdi32.GetStockObject.restype = HGDIOBJ
+    gdi32.CreateFontW.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+    ]
+    gdi32.CreateFontW.restype = HGDIOBJ
+    gdi32.DeleteObject.argtypes = [HGDIOBJ]
+    gdi32.DeleteObject.restype = wintypes.BOOL
     comctl32.InitCommonControlsEx.argtypes = [
         ctypes.POINTER(INITCOMMONCONTROLSEX)
     ]
@@ -330,6 +392,8 @@ if os.name == "nt":
             self.installing = False
             self.install_succeeded = False
             self.ole_initialized = False
+            self.ui_font = None
+            self.owns_ui_font = False
             self.log_queue: queue.Queue[str] = queue.Queue()
 
         def run(self) -> int:
@@ -341,6 +405,7 @@ if os.name == "nt":
                 self._message_loop()
                 return 0 if self.install_succeeded else 1
             finally:
+                self._destroy_resources()
                 self._uninit_ole()
 
         def _init_ole(self) -> None:
@@ -405,7 +470,12 @@ if os.name == "nt":
             user32.UpdateWindow(self.hwnd)
 
         def _create_controls(self) -> None:
-            font = gdi32.GetStockObject(DEFAULT_GUI_FONT)
+            font = self._create_ui_font()
+            if font:
+                self.owns_ui_font = True
+            else:
+                font = gdi32.GetStockObject(DEFAULT_GUI_FONT)
+            self.ui_font = font
             controls = [
                 self._control(
                     "STATIC",
@@ -484,6 +554,24 @@ if os.name == "nt":
             )
             for control in controls:
                 user32.SendMessageW(control, WM_SETFONT, font, True)
+
+        def _create_ui_font(self):
+            return gdi32.CreateFontW(
+                -16,
+                0,
+                0,
+                0,
+                FW_NORMAL,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH,
+                "Microsoft YaHei UI",
+            )
 
         def _control(
             self,
@@ -705,7 +793,8 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
                 self.append_log(text)
 
         def append_log(self, text: str) -> None:
-            clean = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            clean = _clean_log_text(text)
+            clean = clean.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
             if not clean.endswith("\r\n"):
                 clean += "\r\n"
             user32.SendMessageW(self.log_edit, EM_SETSEL, WPARAM_MAX, -1)
@@ -727,6 +816,12 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
                 self._message("Please wait for installation to finish.", "Installing")
                 return
             user32.DestroyWindow(self.hwnd)
+
+        def _destroy_resources(self) -> None:
+            if self.ui_font and self.owns_ui_font:
+                gdi32.DeleteObject(self.ui_font)
+            self.ui_font = None
+            self.owns_ui_font = False
 
         def _message(self, text: str, title: str) -> None:
             user32.MessageBoxW(self.hwnd, text, title, 0)
