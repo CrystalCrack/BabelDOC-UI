@@ -103,13 +103,13 @@ Write-Host "Installing BabelDOC and dependencies..."
 Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "-e", ".")
 
 Write-Host "Installing Windows runtime helpers..."
-Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "msvc-runtime")
+Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "msvc-runtime", "tkinterdnd2")
 
 Write-Host "Pinning a Windows-tested onnxruntime/numpy combination..."
 Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "--force-reinstall", "onnxruntime==1.20.1", "numpy>=2.0.2,<2.3")
 
 Write-Host "Checking imports..."
-Invoke-Checked -FilePath $VenvPython -Arguments @("-c", "import tkinter, numpy, cv2, onnxruntime, openai; print('OK', numpy.__version__, cv2.__version__, onnxruntime.__version__, openai.__version__)")
+Invoke-Checked -FilePath $VenvPython -Arguments @("-c", "import tkinter, tkinterdnd2, numpy, cv2, onnxruntime, openai; print('OK', numpy.__version__, cv2.__version__, onnxruntime.__version__, openai.__version__)")
 
 if (-not $SkipWarmup) {
     Write-Host "Warming up BabelDOC assets. This may download fonts and the layout model..."
