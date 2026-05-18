@@ -87,7 +87,12 @@ function New-BabelDocShortcut {
         [string]$ShortcutPath
     )
 
-    $Launcher = Join-Path $Root "run_babeldoc_ui.bat"
+    $Launcher = Join-Path $Root ".venv\Scripts\pythonw.exe"
+    $Arguments = "-m babeldoc.ui_app"
+    if (-not (Test-Path $Launcher)) {
+        $Launcher = Join-Path $Root "run_babeldoc_ui.bat"
+        $Arguments = ""
+    }
     $Icon = Join-Path $Root "babeldoc\assets\ui\babeldoc-ui-icon.ico"
     $ShortcutFolder = Split-Path -Parent $ShortcutPath
     New-Item -ItemType Directory -Force -Path $ShortcutFolder | Out-Null
@@ -95,6 +100,7 @@ function New-BabelDocShortcut {
     $Shell = New-Object -ComObject WScript.Shell
     $Shortcut = $Shell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = $Launcher
+    $Shortcut.Arguments = $Arguments
     $Shortcut.WorkingDirectory = $Root
     $Shortcut.Description = "BabelDOC UI"
     if (Test-Path $Icon) {
