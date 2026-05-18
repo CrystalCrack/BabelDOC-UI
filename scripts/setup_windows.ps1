@@ -1,6 +1,7 @@
 param(
     [switch]$SkipWarmup,
-    [switch]$NoPythonInstall
+    [switch]$NoPythonInstall,
+    [switch]$NoShortcuts
 )
 
 $ErrorActionPreference = "Stop"
@@ -80,6 +81,28 @@ function Install-Python {
     return $python
 }
 
+function New-BabelDocShortcut {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ShortcutPath
+    )
+
+    $Launcher = Join-Path $Root "run_babeldoc_ui.bat"
+    $Icon = Join-Path $Root "babeldoc\assets\ui\babeldoc-ui-icon.ico"
+    $ShortcutFolder = Split-Path -Parent $ShortcutPath
+    New-Item -ItemType Directory -Force -Path $ShortcutFolder | Out-Null
+
+    $Shell = New-Object -ComObject WScript.Shell
+    $Shortcut = $Shell.CreateShortcut($ShortcutPath)
+    $Shortcut.TargetPath = $Launcher
+    $Shortcut.WorkingDirectory = $Root
+    $Shortcut.Description = "BabelDOC UI"
+    if (Test-Path $Icon) {
+        $Shortcut.IconLocation = "$Icon,0"
+    }
+    $Shortcut.Save()
+}
+
 Write-Host "BabelDOC Windows setup"
 Write-Host "Workspace: $Root"
 
@@ -119,6 +142,17 @@ if (-not $SkipWarmup) {
     Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "babeldoc.main", "--warmup")
 }
 
+if (-not $NoShortcuts) {
+    Write-Host "Creating desktop and Start Menu shortcuts..."
+    $Desktop = [Environment]::GetFolderPath("Desktop")
+    $Programs = [Environment]::GetFolderPath("Programs")
+    New-BabelDocShortcut -ShortcutPath (Join-Path $Desktop "BabelDOC UI.lnk")
+    New-BabelDocShortcut -ShortcutPath (Join-Path $Programs "BabelDOC UI\BabelDOC UI.lnk")
+}
+
 Write-Host ""
 Write-Host "Setup complete."
-Write-Host "Launch the UI with: .\run_babeldoc_ui.bat"
+if (-not $NoShortcuts) {
+    Write-Host "Launch BabelDOC UI from the desktop or Start Menu shortcut."
+}
+Write-Host "You can also launch it with: .\run_babeldoc_ui.bat"
