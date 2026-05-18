@@ -49,6 +49,17 @@ def _clean_log_text(text: str) -> str:
     return "".join(char for char in text if char in "\r\n\t" or ord(char) >= 32)
 
 
+def _is_safe_log_line(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#< CLIXML") or "<Objs " in stripped:
+        return False
+    if stripped.count("?") >= max(6, len(stripped) // 3):
+        return False
+    return all(char in "\r\n\t" or 32 <= ord(char) < 127 for char in stripped)
+
+
 def _resource_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS"))
@@ -103,9 +114,25 @@ def _run_setup(install_dir: Path, log: Callable[[str], None]) -> None:
         env=env,
     )
     assert process.stdout is not None
+    raw_output = bytearray()
+    hidden_lines = 0
+    log("Running setup script. Raw non-ASCII tool output is hidden to avoid mojibake.")
     for line in process.stdout:
-        log(_decode_process_output(line))
+        raw_output.extend(line)
+        text = _decode_process_output(line)
+        if _is_safe_log_line(text):
+            log(text)
+        else:
+            hidden_lines += 1
     return_code = process.wait()
+    log_path = install_dir / "installer_setup.log"
+    try:
+        decoded_output = _decode_process_output(bytes(raw_output))
+        log_path.write_text(decoded_output, encoding="utf-8", errors="replace")
+        if hidden_lines:
+            log(f"Hidden {hidden_lines} raw output lines. Full setup log: {log_path}")
+    except Exception:
+        pass
     if return_code != 0:
         raise RuntimeError(f"Setup failed with exit code {return_code}")
 
