@@ -3,10 +3,11 @@
 ## One-Click Install
 
 1. Double-click `BabelDOC-UI-Setup-<version>.exe`.
-2. Wait for setup to finish. The first install can take a while because Python packages and BabelDOC assets may be downloaded.
-3. Launch `BabelDOC UI` from the desktop or Start Menu shortcut.
+2. Choose the installation folder in the setup window, or keep the default location.
+3. Click `Install` and wait for setup to finish. The first install can take a while because Python packages and BabelDOC assets may be downloaded.
+4. Launch `BabelDOC UI` from the desktop or Start Menu shortcut.
 
-The installer copies the app to `%LOCALAPPDATA%\BabelDOC-UI`, installs the local Python environment there, and creates shortcuts.
+The default install location is `%LOCALAPPDATA%\BabelDOC-UI`. The installer copies the app to the selected folder, installs the local Python environment there, and creates shortcuts.
 
 ## Zip Fallback
 

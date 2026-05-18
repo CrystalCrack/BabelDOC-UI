@@ -86,6 +86,7 @@ $args = @(
     "-m",
     "PyInstaller",
     "--onefile",
+    "--windowed",
     "--clean",
     "--name",
     $ExeName,
