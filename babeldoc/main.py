@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import multiprocessing as mp
+import os
 import queue
 import random
 import sys
@@ -443,6 +444,12 @@ def create_parser():
         help="Do not send temperature parameter to OpenAI API (default: send temperature).",
     )
     service_group.add_argument(
+        "--openai-use-responses",
+        action="store_true",
+        default=False,
+        help="Use OpenAI Responses API instead of Chat Completions API.",
+    )
+    service_group.add_argument(
         "--openai-reasoning",
         type=str,
         default=None,
@@ -490,6 +497,9 @@ async def main():
 
     # 验证 OpenAI 参数
     if args.openai and not args.openai_api_key:
+        args.openai_api_key = os.environ.get("BABELDOC_OPENAI_API_KEY")
+
+    if args.openai and not args.openai_api_key:
         parser.error("使用 OpenAI 服务时必须提供 API key")
 
     if args.enable_process_pool:
@@ -510,6 +520,7 @@ async def main():
             enable_json_mode_if_requested=args.enable_json_mode_if_requested,
             send_dashscope_header=args.send_dashscope_header,
             send_temperature=not args.no_send_temperature,
+            use_responses=args.openai_use_responses,
             **translator_kwargs,
         )
         term_extraction_translator = translator
@@ -533,6 +544,7 @@ async def main():
                 enable_json_mode_if_requested=args.enable_json_mode_if_requested,
                 send_dashscope_header=args.send_dashscope_header,
                 send_temperature=not args.no_send_temperature,
+                use_responses=args.openai_use_responses,
                 **term_translator_kwargs,
             )
     else:

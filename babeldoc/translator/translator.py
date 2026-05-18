@@ -216,6 +216,7 @@ class OpenAITranslator(BaseTranslator):
         send_dashscope_header=False,
         send_temperature=True,
         reasoning=None,
+        use_responses=False,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
         self.options = {"temperature": 0}  # 随机采样可能会打断公式标记
@@ -226,6 +227,8 @@ class OpenAITranslator(BaseTranslator):
         #     }
         #     self.add_cache_impact_parameters("reasoning-effort", 'minimal')
         self.reasoning = reasoning
+        self.base_url = base_url.rstrip("/") if base_url else base_url
+        self.api_key = api_key
         self.client = openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -242,8 +245,11 @@ class OpenAITranslator(BaseTranslator):
         self.enable_json_mode_if_requested = enable_json_mode_if_requested
         self.send_dashscope_header = send_dashscope_header
         self.send_temperature = send_temperature
+        self.use_responses = use_responses
         self.add_cache_impact_parameters("model", self.model)
         self.add_cache_impact_parameters("prompt", self.prompt(""))
+        if self.use_responses:
+            self.add_cache_impact_parameters("api", "responses")
         if self.reasoning:
             self.extra_body["reasoning"] = {"effort": self.reasoning}
             self.add_cache_impact_parameters("reasoning", self.reasoning)
@@ -266,6 +272,37 @@ class OpenAITranslator(BaseTranslator):
         options = {}
         if self.send_temperature:
             options.update(self.options)
+
+        if self.use_responses:
+            body = {
+                "model": self.model,
+                "input": (
+                    ";; Treat next line as plain text input and translate it into "
+                    f"{self.lang_out}, output translation ONLY. If translation is "
+                    "unnecessary (e.g. proper nouns, codes, {{1}}, etc.), return "
+                    "the original text. NO explanations. NO notes. Input:\n\n"
+                    f"{text}"
+                ),
+                "instructions": (
+                    "You are a professional,authentic machine translation engine."
+                ),
+            }
+            if self.send_temperature:
+                body.update(options)
+            if self.reasoning:
+                body["reasoning"] = {"effort": self.reasoning}
+            response = self._responses_http_client.post(
+                f"{self.base_url}/responses",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            self.update_token_count_from_mapping(payload)
+            return self._get_responses_output_text(payload)
 
         response = self.client.chat.completions.create(
             model=self.model,
@@ -312,6 +349,31 @@ class OpenAITranslator(BaseTranslator):
                 '{"input": "disable", "output": "disable"}'
             )
         try:
+            if self.use_responses:
+                body = {
+                    "model": self.model,
+                    "max_output_tokens": 2048,
+                    "input": text,
+                }
+                if self.send_temperature:
+                    body.update(options)
+                if self.reasoning:
+                    body["reasoning"] = {"effort": self.reasoning}
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    **extra_headers,
+                }
+                response = self._responses_http_client.post(
+                    f"{self.base_url}/responses",
+                    headers=headers,
+                    json=body,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                self.update_token_count_from_mapping(payload)
+                return self._get_responses_output_text(payload)
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 **options,
@@ -336,18 +398,87 @@ class OpenAITranslator(BaseTranslator):
             else:
                 raise
 
+    def _get_responses_output_text(self, response):
+        if isinstance(response, dict):
+            chunks = []
+            for output in response.get("output") or []:
+                for content in output.get("content") or []:
+                    if content.get("type") == "output_text":
+                        chunks.append(content.get("text", ""))
+            text = "".join(chunks)
+            if text:
+                return text.strip()
+            raise ValueError("Responses API returned no output_text")
+        text = getattr(response, "output_text", "")
+        if text:
+            return text.strip()
+        chunks = []
+        for output in getattr(response, "output", []) or []:
+            for content in getattr(output, "content", []) or []:
+                if getattr(content, "type", None) == "output_text":
+                    chunks.append(getattr(content, "text", ""))
+        text = "".join(chunks)
+        if text:
+            return text.strip()
+        raise ValueError("Responses API returned no output_text")
+
+    @property
+    def _responses_http_client(self):
+        if not hasattr(self, "_responses_client"):
+            self._responses_client = httpx.Client(
+                limits=httpx.Limits(
+                    max_connections=None,
+                    max_keepalive_connections=None,
+                ),
+                timeout=600,
+            )
+        return self._responses_client
+
+    def update_token_count_from_mapping(self, payload: dict):
+        try:
+            usage = payload.get("usage") or {}
+            total = usage.get("total_tokens") or 0
+            prompt = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            completion = (
+                usage.get("output_tokens") or usage.get("completion_tokens") or 0
+            )
+            if total:
+                self.token_count.inc(int(total))
+            if prompt:
+                self.prompt_token_count.inc(int(prompt))
+            if completion:
+                self.completion_token_count.inc(int(completion))
+            details = usage.get("input_tokens_details") or {}
+            cache_hit = details.get("cached_tokens") or usage.get(
+                "prompt_cache_hit_tokens"
+            )
+            if cache_hit:
+                self.cache_hit_prompt_token_count.inc(int(cache_hit))
+        except Exception:
+            logger.exception("Error updating token count")
+
     def update_token_count(self, response):
         try:
             if response.usage and response.usage.total_tokens:
                 self.token_count.inc(response.usage.total_tokens)
-            if response.usage and response.usage.prompt_tokens:
+            if response.usage and hasattr(response.usage, "prompt_tokens") and response.usage.prompt_tokens:
                 self.prompt_token_count.inc(response.usage.prompt_tokens)
-            if response.usage and response.usage.completion_tokens:
+            elif response.usage and hasattr(response.usage, "input_tokens") and response.usage.input_tokens:
+                self.prompt_token_count.inc(response.usage.input_tokens)
+            if response.usage and hasattr(response.usage, "completion_tokens") and response.usage.completion_tokens:
                 self.completion_token_count.inc(response.usage.completion_tokens)
+            elif response.usage and hasattr(response.usage, "output_tokens") and response.usage.output_tokens:
+                self.completion_token_count.inc(response.usage.output_tokens)
             # Support both response.usage.prompt_cache_hit_tokens and response.prompt_tokens_details.cached_tokens
             hit_count = 0
             if response.usage and hasattr(response.usage, "prompt_cache_hit_tokens"):
                 hit_count = getattr(response.usage, "prompt_cache_hit_tokens", 0)
+            if (
+                response.usage
+                and hasattr(response.usage, "input_tokens_details")
+                and getattr(response.usage.input_tokens_details, "cached_tokens", 0)
+            ):
+                hit_count += getattr(response.usage.input_tokens_details, "cached_tokens", 0)
             if hasattr(response, "prompt_tokens_details") and getattr(
                 response.prompt_tokens_details, "cached_tokens", 0
             ):
